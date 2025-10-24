@@ -504,9 +504,16 @@ def crop_magic_im(image, mask, x, y, w, h, target_w, target_h, padding, downscal
     ctc_y = new_y+up_padding
     ctc_w = new_w
     ctc_h = new_h
+    
+    # Safety check: ensure dimensions are valid
+    if ctc_w <= 0 or ctc_h <= 0:
+        print(f"Warning: Invalid crop dimensions in crop_magic_im: w={ctc_w}, h={ctc_h}")
+        # Return a minimal 1x1 crop to prevent errors
+        ctc_w = max(1, ctc_w)
+        ctc_h = max(1, ctc_h)
 
     # Crop the image and mask
-    cropped_image = canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w]
+    cropped_image = canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w, :]
     cropped_mask = canvas_mask[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w]
 
     # Step 7: Resize image and mask to the target width and height
@@ -522,33 +529,37 @@ def crop_magic_im(image, mask, x, y, w, h, target_w, target_h, padding, downscal
 
 
 def stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ctc_h, cto_x, cto_y, cto_w, cto_h, downscale_algorithm, upscale_algorithm):
+    """Optimized stitching - avoids unnecessary clones"""
+    # Only clone canvas since we modify it
     canvas_image = canvas_image.clone()
-    inpainted_image = inpainted_image.clone()
-    mask = mask.clone()
-
+    
     # Resize inpainted image and mask to match the context size
     _, h, w, _ = inpainted_image.shape
-    if ctc_w > w or ctc_h > h:  # Upscaling
-        resized_image = rescale_i(inpainted_image, ctc_w, ctc_h, upscale_algorithm)
-        resized_mask = rescale_m(mask, ctc_w, ctc_h, upscale_algorithm)
-    else:  # Downscaling
-        resized_image = rescale_i(inpainted_image, ctc_w, ctc_h, downscale_algorithm)
-        resized_mask = rescale_m(mask, ctc_w, ctc_h, downscale_algorithm)
+    if ctc_w != w or ctc_h != h:
+        if ctc_w > w or ctc_h > h:  # Upscaling
+            resized_image = rescale_i(inpainted_image, ctc_w, ctc_h, upscale_algorithm)
+            resized_mask = rescale_m(mask, ctc_w, ctc_h, upscale_algorithm)
+        else:  # Downscaling
+            resized_image = rescale_i(inpainted_image, ctc_w, ctc_h, downscale_algorithm)
+            resized_mask = rescale_m(mask, ctc_w, ctc_h, downscale_algorithm)
+    else:
+        resized_image = inpainted_image
+        resized_mask = mask
 
     # Clamp mask to [0, 1] and expand to match image channels
     resized_mask = resized_mask.clamp(0, 1).unsqueeze(-1)  # shape: [1, H, W, 1]
 
     # Extract the canvas region we're about to overwrite
-    canvas_crop = canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w]
+    canvas_crop = canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w, :]
 
     # Blend: new = mask * inpainted + (1 - mask) * canvas
     blended = resized_mask * resized_image + (1.0 - resized_mask) * canvas_crop
 
     # Paste the blended region back onto the canvas
-    canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w] = blended
+    canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w, :] = blended
 
     # Final crop to get back the original image area
-    output_image = canvas_image[:, cto_y:cto_y + cto_h, cto_x:cto_x + cto_w]
+    output_image = canvas_image[:, cto_y:cto_y + cto_h, cto_x:cto_x + cto_w, :]
 
     return output_image
 
@@ -696,15 +707,30 @@ class InpaintCropImproved:
         
         profile_times = {}
         
-        # Clone inputs and move to device
+        # Move to device (clone only if necessary)
         t0 = time.time()
-        image = image.clone().to(device)
+        if image.device != device:
+            image = image.to(device)
+        else:
+            image = image.clone()
+        
         if mask is not None:
-            mask = mask.clone().to(device)
+            if mask.device != device:
+                mask = mask.to(device)
+            else:
+                mask = mask.clone()
+        
         if optional_context_mask is not None:
-            optional_context_mask = optional_context_mask.clone().to(device)
+            if optional_context_mask.device != device:
+                optional_context_mask = optional_context_mask.to(device)
+            else:
+                optional_context_mask = optional_context_mask.clone()
+        
         profile_times['clone_inputs'] = time.time() - t0
-        print(f"[DONE] Clone inputs & move to {device_name}: {profile_times['clone_inputs']:.3f}s")
+        if profile_times['clone_inputs'] > 1.0:
+            print(f"[INFO] Moving to {device_name}: {profile_times['clone_inputs']:.3f}s (consider reducing batch size for faster GPU transfer)")
+        else:
+            print(f"[DONE] Prepare inputs on {device_name}: {profile_times['clone_inputs']:.3f}s")
 
         output_padding = int(output_padding)
         
@@ -928,13 +954,15 @@ class InpaintCropImproved:
         print(f"\n[DONE] Individual crops complete: {profile_times['individual_crops']:.3f}s total")
         print(f"   Average per image: {profile_times['individual_crops']/batch_size:.3f}s")
         
-        # Blur blend masks (they have different sizes so can't batch)
+        # Blur blend masks (process individually due to different sizes)
         if mask_blend_pixels > 0:
             print(f"\n[BLUR_MASKS] Applying blur to {batch_size} blend masks...")
             t0 = time.time()
-            # Blur each mask (they have different sizes after cropping)
+            # Blur each mask individually (they have different sizes after cropping)
             blurred_masks = []
             for i, mask in enumerate(result_stitcher['cropped_mask_for_blend']):
+                if i % 50 == 0 and i > 0:
+                    print(f"      Processed {i}/{batch_size} masks...")
                 blurred = blur_m(mask, mask_blend_pixels * 0.5)
                 blurred_masks.append(blurred)
             result_stitcher['cropped_mask_for_blend'] = blurred_masks
@@ -1177,6 +1205,9 @@ class InpaintStitchImproved:
             "required": {
                 "stitcher": ("STITCHER",),
                 "inpainted_image": ("IMAGE",),
+            },
+            "optional": {
+                "use_gpu": (["auto", "yes", "no"], {"default": "auto", "tooltip": "Use GPU acceleration if available. 'auto' detects automatically."}),
             }
         }
 
@@ -1189,36 +1220,158 @@ class InpaintStitchImproved:
     FUNCTION = "inpaint_stitch"
 
 
-    def inpaint_stitch(self, stitcher, inpainted_image):
-        inpainted_image = inpainted_image.clone()
-        results = []
-
+    def inpaint_stitch(self, stitcher, inpainted_image, use_gpu="auto"):
+        # Start timing
+        import time
+        start_time = time.time()
+        
         batch_size = inpainted_image.shape[0]
+        
+        # Determine device to use
+        if use_gpu == "yes" or (use_gpu == "auto" and torch.cuda.is_available()):
+            device = torch.device('cuda:0')
+            device_name = f"GPU ({torch.cuda.get_device_name(0)})"
+        else:
+            device = torch.device('cpu')
+            device_name = "CPU"
+        
+        print(f"\n>>> InpaintStitchImproved: Processing {batch_size} images on {device_name}")
+        
+        # Move inpainted images to device
+        inpainted_image = inpainted_image.clone().to(device)
+        
+        # Check batch size compatibility
         assert len(stitcher['cropped_to_canvas_x']) == batch_size or len(stitcher['cropped_to_canvas_x']) == 1, "Stitch batch size doesn't match image batch size"
-        override = False
-        if len(stitcher['cropped_to_canvas_x']) != batch_size and len(stitcher['cropped_to_canvas_x']) == 1:
-            override = True
+        override = len(stitcher['cropped_to_canvas_x']) == 1 and batch_size > 1
+        
+        results = []
+        
+        # Process each image
         for b in range(batch_size):
-            one_image = inpainted_image[b]
-            one_stitcher = {}
-            for key in ['downscale_algorithm', 'upscale_algorithm', 'blend_pixels']:
-                one_stitcher[key] = stitcher[key]
-            for key in ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h', 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y', 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend']:
-                if override: # One stitcher for many images, always read 0.
-                    one_stitcher[key] = stitcher[key][0]
-                else:
-                    one_stitcher[key] = stitcher[key][b]
-            one_image = one_image.unsqueeze(0)
-            one_image, = self.inpaint_stitch_single_image(one_stitcher, one_image)
-            one_image = one_image.squeeze(0)
-            one_image = one_image.clone()
-            results.append(one_image)
-
+            if b % 20 == 0:
+                print(f"   Stitching image {b+1}/{batch_size}...")
+            
+            # Get data for this image
+            idx = 0 if override else b
+            
+            # Move canvas and mask to device
+            canvas_image = stitcher['canvas_image'][idx].to(device)
+            mask = stitcher['cropped_mask_for_blend'][idx].to(device)
+            
+            # Get coordinates
+            ctc_x = stitcher['cropped_to_canvas_x'][idx]
+            ctc_y = stitcher['cropped_to_canvas_y'][idx]
+            ctc_w = stitcher['cropped_to_canvas_w'][idx]
+            ctc_h = stitcher['cropped_to_canvas_h'][idx]
+            cto_x = stitcher['canvas_to_orig_x'][idx]
+            cto_y = stitcher['canvas_to_orig_y'][idx]
+            cto_w = stitcher['canvas_to_orig_w'][idx]
+            cto_h = stitcher['canvas_to_orig_h'][idx]
+            
+            # Process single image (optimized)
+            one_image = inpainted_image[b].unsqueeze(0)
+            # FIX: Don't unsqueeze canvas_image - it already has batch dimension
+            # Check if canvas_image needs batch dimension
+            if canvas_image.dim() == 3:  # If it's HWC, add batch dimension
+                canvas_image = canvas_image.unsqueeze(0)
+            # If it's already 4D (BHWC), use as is
+            
+            output_image = self.stitch_single_optimized(
+                canvas_image, one_image, mask,
+                ctc_x, ctc_y, ctc_w, ctc_h,
+                cto_x, cto_y, cto_w, cto_h,
+                stitcher['downscale_algorithm'],
+                stitcher['upscale_algorithm']
+            )
+            
+            results.append(output_image.squeeze(0))
+        
+        # Stack results and move back to CPU for ComfyUI
         result_batch = torch.stack(results, dim=0)
-
+        if device.type == 'cuda':
+            result_batch = result_batch.cpu()
+        
+        elapsed = time.time() - start_time
+        print(f"   Done! Total: {elapsed:.2f}s ({elapsed/batch_size:.3f}s per image)")
+        
         return (result_batch,)
 
+    def stitch_single_optimized(self, canvas_image, inpainted_image, mask,
+                                ctc_x, ctc_y, ctc_w, ctc_h,
+                                cto_x, cto_y, cto_w, cto_h,
+                                downscale_algorithm, upscale_algorithm):
+        """Optimized single image stitching - no unnecessary clones, stays on device"""
+        device = canvas_image.device
+        
+        # Ensure canvas_image is 4D (BHWC), not 5D
+        if canvas_image.dim() == 5:
+            # If shape is [1, 1, H, W, C] or [B, 1, H, W, C], squeeze the extra dimension
+            canvas_image = canvas_image.squeeze(1)
+        
+        # Use the provided dimensions (ctc_w, ctc_h) which are the target dimensions
+        target_w = ctc_w
+        target_h = ctc_h
+        
+        # Skip if target dimensions are invalid
+        if target_w <= 0 or target_h <= 0:
+            print(f"Warning: Invalid target dimensions w={target_w}, h={target_h}, returning canvas unchanged")
+            return canvas_image
+        
+        # Resize inpainted image and mask to match the target dimensions
+        _, h, w, _ = inpainted_image.shape
+        if target_w != w or target_h != h:
+            # Always resize to match the target dimensions
+            resized_image = rescale_i(inpainted_image, target_w, target_h, 
+                                     upscale_algorithm if target_w > w or target_h > h else downscale_algorithm)
+            # Handle mask dimensions properly
+            if mask.dim() == 2:  # HW format
+                mask = mask.unsqueeze(0)  # Add batch dimension -> BHW
+            if mask.shape[-2:] != (target_h, target_w):  # Check last two dims (H, W)
+                resized_mask = rescale_m(mask, target_w, target_h,
+                                       upscale_algorithm if target_w > w or target_h > h else downscale_algorithm)
+            else:
+                resized_mask = mask
+        else:
+            resized_image = inpainted_image
+            resized_mask = mask
+            if mask.dim() == 2:
+                resized_mask = mask.unsqueeze(0)
+        
+        # Ensure mask is in right shape and clamped
+        resized_mask = resized_mask.clamp(0, 1)
+        
+        # Ensure mask has the right number of dimensions
+        if resized_mask.dim() == 3:  # BHW
+            resized_mask = resized_mask.unsqueeze(-1)  # BHW -> BHWC
+        elif resized_mask.dim() == 2:  # HW
+            resized_mask = resized_mask.unsqueeze(0).unsqueeze(-1)  # HW -> BHWC
+        
+        # Extract the canvas region we're about to overwrite
+        canvas_crop = canvas_image[:, ctc_y:ctc_y + target_h, ctc_x:ctc_x + target_w, :]
+        
+        # Ensure dimensions match exactly before blending (safety check)
+        if resized_image.shape[1:3] != (target_h, target_w):
+            print(f"WARNING: Image shape mismatch after resize - Image: {resized_image.shape}, Target: ({target_h}, {target_w})")
+            resized_image = rescale_i(resized_image, target_w, target_h, 'bilinear')
+        
+        if resized_mask.shape[1:3] != (target_h, target_w):
+            print(f"WARNING: Mask shape mismatch - Mask: {resized_mask.shape}, Target: ({target_h}, {target_w})")
+            resized_mask = rescale_m(resized_mask.squeeze(-1), target_w, target_h, 'bilinear')
+            resized_mask = resized_mask.unsqueeze(-1)
+        
+        # Blend: new = mask * inpainted + (1 - mask) * canvas
+        blended = resized_mask * resized_image + (1.0 - resized_mask) * canvas_crop
+        
+        # Paste the blended region back onto the canvas
+        canvas_image[:, ctc_y:ctc_y + target_h, ctc_x:ctc_x + target_w, :] = blended
+        
+        # Final crop to get back the original image area
+        output_image = canvas_image[:, cto_y:cto_y + cto_h, cto_x:cto_x + cto_w, :]
+        
+        return output_image
+    
     def inpaint_stitch_single_image(self, stitcher, inpainted_image):
+        """Legacy method for compatibility"""
         downscale_algorithm = stitcher['downscale_algorithm']
         upscale_algorithm = stitcher['upscale_algorithm']
         canvas_image = stitcher['canvas_image']

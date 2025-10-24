@@ -436,7 +436,7 @@ def crop_magic_im(image, mask, x, y, w, h, target_w, target_h, padding, downscal
     ctc_h = new_h
 
     # Crop the image and mask
-    cropped_image = canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w]
+    cropped_image = canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w, :]
     cropped_mask = canvas_mask[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w]
 
     # Step 7: Resize image and mask to the target width and height
@@ -469,16 +469,16 @@ def stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ct
     resized_mask = resized_mask.clamp(0, 1).unsqueeze(-1)  # shape: [1, H, W, 1]
 
     # Extract the canvas region we're about to overwrite
-    canvas_crop = canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w]
+    canvas_crop = canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w, :]
 
     # Blend: new = mask * inpainted + (1 - mask) * canvas
     blended = resized_mask * resized_image + (1.0 - resized_mask) * canvas_crop
 
     # Paste the blended region back onto the canvas
-    canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w] = blended
+    canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w, :] = blended
 
     # Final crop to get back the original image area
-    output_image = canvas_image[:, cto_y:cto_y + cto_h, cto_x:cto_x + cto_w]
+    output_image = canvas_image[:, cto_y:cto_y + cto_h, cto_x:cto_x + cto_w, :]
 
     return output_image
 
